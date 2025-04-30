@@ -1,6 +1,5 @@
 import os
 import streamlit as st
-import google.generativeai as genai
 import pandas as pd
 from docx import Document
 import io
@@ -11,6 +10,9 @@ from pathlib import Path
 from llama_parse import LlamaParse
 from dotenv import load_dotenv
 import tempfile
+import requests
+import json
+from openai import OpenAI
 
 # Load environment variables
 load_dotenv()
@@ -20,14 +22,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Get API keys from environment variables
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 
-if not GEMINI_API_KEY or not LLAMA_CLOUD_API_KEY:
+if not LLAMA_CLOUD_API_KEY:
     raise ValueError("Missing required API keys in environment variables")
-
-# Configure Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
 
 # Initialize LlamaParse
 parser = LlamaParse(
@@ -36,111 +34,69 @@ parser = LlamaParse(
     verbose=True
 )
 
-# Create the model
-generation_config = {
-    "temperature": 0.7,
-    "top_p": 0.95,
-    "top_k": 64,
-    "max_output_tokens": 8192,
-    "response_mime_type": "text/plain",
-}
+# Configure local model settings
+MODEL_NAME = "qwen2.5:latest"
 
-safety_settings = [
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-]
+# Initialize OpenAI client for Ollama
+client = OpenAI(
+    base_url="http://localhost:11434/v1",
+    api_key="not-needed"  # Ollama doesn't need an API key
+)
 
-# Update model initialization
-try:
-    model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash-thinking-exp-1219",  # Using stable model version
-        generation_config=generation_config,
-        safety_settings=safety_settings,
-    )
-except Exception as e:
-    logger.error(f"Failed to initialize Gemini model: {e}")
-    raise
-
-def extract_text_from_pdf(file) -> Tuple[str, List[pd.DataFrame]]:
-    """
-    Extract text from PDF file using LlamaParse
-    
-    Args:
-        file: File-like object containing PDF
+def check_model_availability():
+    """Check if the model is available and running"""
+    try:
+        logger.info("Checking model availability...")
+        response = requests.get("http://localhost:11434/api/tags")
+        response.raise_for_status()
+        models = response.json().get('models', [])
+        available_models = [model['name'] for model in models]
         
-    Returns:
-        Tuple[str, List[pd.DataFrame]]: Extracted text and tables
+        if MODEL_NAME not in available_models:
+            logger.error(f"Model {MODEL_NAME} is not available. Available models: {available_models}")
+            return False
+            
+        logger.info(f"Model {MODEL_NAME} is available")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to check model availability: {e}")
+        return False
+
+# Check model availability at startup
+if not check_model_availability():
+    raise RuntimeError(f"Model {MODEL_NAME} is not available. Please make sure Ollama is running and the model is pulled.")
+
+def generate_response(prompt: str) -> str:
+    """
+    Generate response using local Qwen model through Ollama with OpenAI client
     """
     try:
-        # Create a temporary file to save the uploaded content
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            tmp_file.write(file.getvalue())
-            tmp_path = tmp_file.name
-
-        # Parse the PDF using LlamaParse
-        result = parser.load_data(tmp_path)
+        logger.info(f"Sending prompt to local Qwen model")
         
-        # Combine all pages into one text
-        text = "\n\n---\n\n".join([page.text for page in result])
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            top_p=0.95,
+            max_tokens=1000
+        )
         
-        # Extract tables if available
-        tables = []
-        for page in result:
-            if hasattr(page, 'tables') and page.tables:
-                for table in page.tables:
-                    try:
-                        df = pd.DataFrame(table)
-                        if not df.empty:
-                            tables.append(df)
-                    except Exception as e:
-                        logger.warning(f"Failed to convert table to DataFrame: {e}")
-
-        # Clean up temporary file
-        os.unlink(tmp_path)
+        logger.info("Received response from local Qwen model")
+        
+        if not response or not response.choices:
+            logger.warning("Empty response received from local Qwen model")
+            return None
             
-        return text, tables
+        return response.choices[0].message.content
     except Exception as e:
-        logger.error(f"PDF extraction failed: {e}")
-        raise RuntimeError(f"Failed to process PDF: {str(e)}")
-
-def extract_text_from_docx(file):
-    """Extract text and tables from DOCX file"""
-    doc = Document(file)
-    text = ""
-    tables = []
-    
-    # Extract text
-    for paragraph in doc.paragraphs:
-        text += paragraph.text + "\n"
-    
-    # Extract tables
-    for table in doc.tables:
-        table_data = []
-        for row in table.rows:
-            row_data = [cell.text for cell in row.cells]
-            table_data.append(row_data)
-        tables.append(pd.DataFrame(table_data[1:], columns=table_data[0]))
-    
-    return text, tables
-
-def extract_text_from_txt(file):
-    """Extract text from TXT file"""
-    text = file.getvalue().decode()
-    return text, []
-
-def clean_text(text):
-    """Clean extracted text"""
-    # Remove excessive whitespace
-    text = re.sub(r'\s+', ' ', text)
-    # Remove special characters but keep basic punctuation
-    text = re.sub(r'[^\w\s.,!?-]', '', text)
-    return text.strip()
+        logger.error(f"Error generating response: {e}", exc_info=True)
+        return None
 
 def analyze_section(text, section_type="requirements"):
     """Analyze specific sections of the RFP"""
-    chat = model.start_chat(history=[])
+    logger.info(f"Starting {section_type} section analysis")
     
     prompts = {
         "requirements": """
@@ -163,32 +119,35 @@ def analyze_section(text, section_type="requirements"):
             2. Identify certification needs
             3. Note security requirements
             4. Flag critical compliance issues
+            """,
+        "positions": """
+            Analyze the staffing requirements in this section and provide a detailed markdown-formatted response covering:
+            1. Extract all listed job positions or roles
+            2. For each position, extract its full job description (JD), including:
+                a. Responsibilities
+                b. Required qualifications (e.g., certifications, education, experience, skills)
+                c. Preferred or optional qualifications (e.g., certifications, languages)
+                d. Keywords for resume matching
+            3. Flag any ambiguous or unclear position descriptions
             """
     }
     
-    response = chat.send_message(f"{prompts.get(section_type, prompts['requirements'])}\n\nContent:\n{text}")
-    return response.text
-
-def analyze_tables(tables):
-    """Analyze tables found in the document"""
-    analysis = []
-    for i, table in enumerate(tables):
-        if not table.empty:
-            analysis.append(f"\nTable {i+1} Analysis:")
-            analysis.append(f"- Columns: {', '.join(table.columns.tolist())}")
-            analysis.append(f"- Rows: {len(table)}")
-            analysis.append("- Content Summary:")
-            for col in table.columns:
-                unique_values = table[col].nunique()
-                analysis.append(f"  * {col}: {unique_values} unique values")
-    
-    return "\n".join(analysis)
+    try:
+        prompt = f"{prompts.get(section_type, prompts['requirements'])}\n\nContent:\n{text}"
+        response = generate_response(prompt)
+        if not response:
+            logger.warning(f"Empty response received for {section_type} analysis")
+            return None
+        return response
+    except Exception as e:
+        logger.error(f"Error in {section_type} analysis: {e}", exc_info=True)
+        return None
 
 def analyze_rfp_content(text: str) -> str:
     """
     Analyze the full content of the RFP document.
     """
-    chat = model.start_chat(history=[])
+    logger.info("Starting RFP content analysis")
     prompt = """
     Analyze this RFP document and provide a detailed markdown-formatted response covering:
 
@@ -224,30 +183,167 @@ def analyze_rfp_content(text: str) -> str:
     {text}
     """
     try:
-        response = chat.send_message(prompt.format(text=text))
-        return response.text
+        response = generate_response(prompt.format(text=text))
+        if not response:
+            logger.warning("Empty response received for RFP content analysis")
+            return None
+        return response
     except Exception as e:
-        logger.error(f"Error analyzing RFP content: {e}")
-        return "Error analyzing content. Please try again."
+        logger.error(f"Error analyzing RFP content: {e}", exc_info=True)
+        return None
+
+def extract_text_from_pdf(file) -> Tuple[str, List[pd.DataFrame]]:
+    """
+    Extract text from PDF file using LlamaParse
+    
+    Args:
+        file: File-like object containing PDF
+        
+    Returns:
+        Tuple[str, List[pd.DataFrame]]: Extracted text and tables
+    """
+    try:
+        logger.info("Starting PDF extraction")
+        # Create a temporary file to save the uploaded content
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(file.getvalue())
+            tmp_path = tmp_file.name
+            logger.info(f"Created temporary file: {tmp_path}")
+
+        # Parse the PDF using LlamaParse
+        logger.info("Parsing PDF with LlamaParse")
+        result = parser.load_data(tmp_path)
+        logger.info("PDF parsing completed")
+        
+        # Combine all pages into one text
+        logger.info("Extracting text from pages")
+        text = "\n\n---\n\n".join([page.text for page in result])
+        
+        # Extract tables if available
+        tables = []
+        logger.info("Starting table extraction")
+        for page in result:
+            if hasattr(page, 'tables') and page.tables:
+                for table in page.tables:
+                    try:
+                        df = pd.DataFrame(table)
+                        if not df.empty:
+                            tables.append(df)
+                    except Exception as e:
+                        logger.warning(f"Failed to convert table to DataFrame: {e}")
+
+        logger.info(f"Extracted {len(tables)} tables from PDF")
+
+        # Clean up temporary file
+        os.unlink(tmp_path)
+        logger.info("Temporary file cleaned up")
+            
+        return text, tables
+    except Exception as e:
+        logger.error(f"PDF extraction failed: {e}", exc_info=True)
+        raise RuntimeError(f"Failed to process PDF: {str(e)}")
+
+def extract_text_from_docx(file):
+    """Extract text and tables from DOCX file"""
+    logger.info("Starting DOCX extraction")
+    try:
+        doc = Document(file)
+        text = ""
+        tables = []
+        
+        # Extract text
+        logger.info("Extracting text from paragraphs")
+        for paragraph in doc.paragraphs:
+            text += paragraph.text + "\n"
+        
+        # Extract tables
+        logger.info("Starting table extraction from DOCX")
+        for table in doc.tables:
+            table_data = []
+            for row in table.rows:
+                row_data = [cell.text for cell in row.cells]
+                table_data.append(row_data)
+            tables.append(pd.DataFrame(table_data[1:], columns=table_data[0]))
+        
+        logger.info(f"Extracted {len(tables)} tables from DOCX")
+        return text, tables
+    except Exception as e:
+        logger.error(f"DOCX extraction failed: {e}", exc_info=True)
+        raise
+
+def extract_text_from_txt(file):
+    """Extract text from TXT file"""
+    logger.info("Starting TXT file extraction")
+    try:
+        text = file.getvalue().decode()
+        logger.info("TXT file extraction completed")
+        return text, []
+    except Exception as e:
+        logger.error(f"TXT extraction failed: {e}", exc_info=True)
+        raise
+
+def clean_text(text):
+    """Clean extracted text"""
+    logger.info("Starting text cleaning")
+    try:
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        # Remove special characters but keep basic punctuation
+        text = re.sub(r'[^\w\s.,!?-]', '', text)
+        cleaned = text.strip()
+        logger.info("Text cleaning completed")
+        return cleaned
+    except Exception as e:
+        logger.error(f"Text cleaning failed: {e}", exc_info=True)
+        raise
+
+def analyze_tables(tables):
+    """Analyze tables found in the document"""
+    analysis = []
+    for i, table in enumerate(tables):
+        if not table.empty:
+            analysis.append(f"\nTable {i+1} Analysis:")
+            analysis.append(f"- Columns: {', '.join(table.columns.tolist())}")
+            analysis.append(f"- Rows: {len(table)}")
+            analysis.append("- Content Summary:")
+            for col in table.columns:
+                unique_values = table[col].nunique()
+                analysis.append(f"  * {col}: {unique_values} unique values")
+    
+    return "\n".join(analysis)
 
 # Update the main function to include caching
 @st.cache_data
 def process_document(file_content, file_type: str) -> Tuple[str, List[pd.DataFrame]]:
     """Cache the document processing results"""
-    if file_type == 'pdf':
-        return extract_text_from_pdf(file_content)
-    elif file_type == 'docx':
-        return extract_text_from_docx(file_content)
-    else:  # txt
-        return extract_text_from_txt(file_content)
+    logger.info(f"Starting document processing for file type: {file_type}")
+    try:
+        if file_type == 'pdf':
+            logger.info("Processing PDF document")
+            result = extract_text_from_pdf(file_content)
+        elif file_type == 'docx':
+            logger.info("Processing DOCX document")
+            result = extract_text_from_docx(file_content)
+        else:  # txt
+            logger.info("Processing TXT document")
+            result = extract_text_from_txt(file_content)
+        logger.info("Document processing completed successfully")
+        return result
+    except Exception as e:
+        logger.error(f"Error in process_document: {str(e)}")
+        raise
 
 def main():
+    logger.info("Starting RFP Document Analyzer application")
     st.set_page_config(page_title="RFP Document Analyzer", layout="wide")
     
     # Check for API keys
-    if not GEMINI_API_KEY or not LLAMA_CLOUD_API_KEY:
+    if not LLAMA_CLOUD_API_KEY:
+        logger.error("Missing required API keys in environment variables!")
         st.error("Missing required API keys in environment variables!")
         st.stop()
+    
+    logger.info("API keys validated successfully")
     
     # Move controls to sidebar
     with st.sidebar:
@@ -263,6 +359,7 @@ def main():
         )
         
         if uploaded_file:
+            logger.info(f"File uploaded: {uploaded_file.name} (Size: {uploaded_file.size/1024:.2f} KB)")
             st.write(f"File: {uploaded_file.name}")
             st.write(f"Size: {uploaded_file.size/1024:.2f} KB")
             
@@ -271,30 +368,26 @@ def main():
             analyze_req = st.button("📋 Analyze Requirements", use_container_width=True)
             analyze_timeline = st.button("⏱️ Analyze Timeline", use_container_width=True)
             analyze_compliance = st.button("✓ Analyze Compliance", use_container_width=True)
-        
-        # Add tips in sidebar
-        st.markdown("---")
-        st.markdown("### 💡 Analysis Tips")
-        st.markdown("""
-        1. Upload your RFP document
-        2. Choose analysis type
-        3. Review results in main panel
-        """)
+            analyze_positions = st.button("👤 Analyze Job Descriptions", use_container_width=True)
 
     # Main content area
     if uploaded_file:
         if uploaded_file.size > MAX_FILE_SIZE:
+            logger.warning(f"File size ({uploaded_file.size/1024/1024:.2f}MB) exceeds limit of 50MB")
             st.error("File size exceeds 50MB limit. Please upload a smaller file.")
             return
             
         try:
+            logger.info("Starting document processing")
             # Process document with caching
             text, tables = process_document(
                 uploaded_file,
                 uploaded_file.name.split('.')[-1].lower()
             )
+            logger.info(f"Document processed successfully. Found {len(tables)} tables")
             
             # Clean extracted text
+            logger.info("Cleaning extracted text")
             cleaned_text = clean_text(text)
             
             # Create two columns for better layout
@@ -305,24 +398,56 @@ def main():
                 
                 # Show analysis based on button clicks
                 if analyze_full:
+                    logger.info("Starting full content analysis")
                     with st.spinner("Analyzing full content..."):
                         analysis = analyze_rfp_content(cleaned_text)
-                        st.markdown(analysis)
+                        logger.info("Full content analysis completed")
+                        if analysis:
+                            logger.info("Displaying analysis results")
+                            st.markdown(analysis)
+                        else:
+                            logger.warning("No analysis results to display")
+                            st.warning("No analysis results available. Please try again.")
                 
                 if analyze_req:
+                    logger.info("Starting requirements analysis")
                     with st.spinner("Analyzing requirements..."):
                         req_analysis = analyze_section(cleaned_text, "requirements")
-                        st.markdown(req_analysis)
+                        logger.info("Requirements analysis completed")
+                        if req_analysis:
+                            st.markdown(req_analysis)
+                        else:
+                            st.warning("No requirements analysis available. Please try again.")
                 
                 if analyze_timeline:
+                    logger.info("Starting timeline analysis")
                     with st.spinner("Analyzing timeline..."):
                         timeline_analysis = analyze_section(cleaned_text, "timeline")
-                        st.markdown(timeline_analysis)
+                        logger.info("Timeline analysis completed")
+                        if timeline_analysis:
+                            st.markdown(timeline_analysis)
+                        else:
+                            st.warning("No timeline analysis available. Please try again.")
                 
                 if analyze_compliance:
+                    logger.info("Starting compliance analysis")
                     with st.spinner("Analyzing compliance..."):
                         compliance_analysis = analyze_section(cleaned_text, "compliance")
-                        st.markdown(compliance_analysis)
+                        logger.info("Compliance analysis completed")
+                        if compliance_analysis:
+                            st.markdown(compliance_analysis)
+                        else:
+                            st.warning("No compliance analysis available. Please try again.")
+
+                if analyze_positions:
+                    logger.info("Starting positions analysis")
+                    with st.spinner("Analyzing positions..."):
+                        positions_analysis = analyze_section(cleaned_text, "positions")
+                        logger.info("Positions analysis completed")
+                        if positions_analysis:
+                            st.markdown(positions_analysis)
+                        else:
+                            st.warning("No positions analysis available. Please try again.")
             
             with col2:
                 # Show extracted text and tables
@@ -330,6 +455,7 @@ def main():
                     st.text_area("Content", cleaned_text, height=300)
                 
                 if tables:
+                    logger.info(f"Displaying {len(tables)} extracted tables")
                     with st.expander("📊 Extracted Tables", expanded=False):
                         table_analysis = analyze_tables(tables)
                         st.markdown(table_analysis)
@@ -338,9 +464,11 @@ def main():
                             st.dataframe(table, use_container_width=True)
                 
         except Exception as e:
+            logger.error(f"Error processing document: {str(e)}", exc_info=True)
             st.error(f"Error processing document: {str(e)}")
             st.error("Please make sure the document is not corrupted and try again.")
     else:
+        logger.info("No file uploaded - displaying welcome message")
         # Show welcome message when no file is uploaded
         st.markdown("""
         # Welcome to RFP Document Analyzer! 👋
@@ -351,9 +479,17 @@ def main():
         - Identifying key requirements
         - Analyzing timelines and milestones
         - Checking compliance requirements
+        - Extracting job descriptions
         
         To get started, upload your RFP document using the sidebar.
         """)
 
 if __name__ == "__main__":
-    main()
+    try:
+        logger.info("Starting RFP Analyzer application")
+        main()
+        logger.info("Application completed successfully")
+    except Exception as e:
+        logger.error("Application crashed", exc_info=True)
+        st.error("🚨 App crashed due to an internal error.")
+        st.exception(e)  # This shows full traceback in Streamlit app
